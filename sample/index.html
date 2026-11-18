@@ -1,0 +1,339 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Single Dot Motion</title>
+<style>html,body{margin:0;background:#F3F0E8;overflow:hidden}canvas{display:block}</style>
+</head><body><canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// 16-single-dot-motion-system 샘플 · 1920x1080 · 13.6초 루프 · 모든 것은 seek(t)의 순수 함수
+const W = 1920, H = 1080, DUR = 13.6;
+const BG = '#F3F0E8', INK = '#111111', OR = '#FF5A1F', GRAY = '#D6D1C6', CARD = '#FFFFFF';
+const SANS = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+const MONO = 'Menlo, "SF Mono", monospace';
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+ctx.fontKerning = 'none';
+
+// ---- motion helpers (scripts/motion.js 와 동일) ----
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, k) => a + (b - a) * k;
+const R = (t, a, b) => clamp((t - a) / (b - a));
+const eio = k => (k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2);
+const eo = k => 1 - Math.pow(1 - k, 3);
+const ei = k => k * k * k;
+function sp(dt, f = 2.2, z = 0.75) {
+  if (dt <= 0) return 0;
+  const w = 2 * Math.PI * f;
+  if (z >= 1) return 1 - Math.exp(-w * dt) * (1 + w * dt);
+  const wd = w * Math.sqrt(1 - z * z);
+  return 1 - Math.exp(-z * w * dt) * (Math.cos(wd * dt) + (z * w / wd) * Math.sin(wd * dt));
+}
+// 착지 충격: 감쇠 진동 (0에서 시작해 0으로)
+const bump = (dt, f = 5, d = 9) => (dt <= 0 ? 0 : Math.exp(-dt * d) * Math.sin(dt * f * 2 * Math.PI));
+const fall = (dt, g = 4200) => (dt <= 0 ? 0 : 0.5 * g * dt * dt);
+
+function layout(text, size, weight, font = SANS) {
+  ctx.font = `${weight} ${size}px ${font}`;
+  let x = 0;
+  const L = [...text].map(ch => { const w = ctx.measureText(ch).width; const o = { ch, x, w }; x += w; return o; });
+  return { L, w: x };
+}
+function glyph(ch, x, y, size, weight, color, rot = 0, sc = 1, font = SANS) {
+  if (sc <= 0.001) return;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.scale(sc, sc);
+  ctx.font = `${weight} ${size}px ${font}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  ctx.fillText(ch, 0, 0); ctx.restore();
+}
+function rrect(cx, cy, w, h, r, color) {
+  if (w <= 0 || h <= 0) return;
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath(); ctx.roundRect(cx - w / 2, cy - h / 2, w, h, r); ctx.fillStyle = color; ctx.fill();
+}
+function circle(x, y, r, color, sx = 1, sy = 1) {
+  if (r <= 0) return;
+  ctx.beginPath(); ctx.ellipse(x, y, r * sx, r * sy, 0, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+}
+
+// ---- 고정 레이아웃 ----
+const CARD_W = 780, CARD_H = 170, CX = 960, CY = 540;
+const LBL_SIZE = 58, LBL_X = CX - CARD_W / 2 + 64, LBL_Y = CY + 21;
+const TRACK = { x: CX + CARD_W / 2 - 64 - 66, w: 132, h: 72 };
+const KNOB_OFF = TRACK.x - TRACK.w / 2 + 36, KNOB_ON = TRACK.x + TRACK.w / 2 - 36, KNOB_R = 27;
+const BIG = 250, BIG_Y = 640;
+const G = { x: 470, y: 820, w: 980, h: 380 }; // 그래프 원점과 크기
+const ORBIT_R = 330;
+const END = { size: 150, y: 590 };
+
+const label = layout('Reduce Motion', LBL_SIZE, 650);
+const bigM = layout('Motıon', BIG, 750);
+const bigX0 = CX - bigM.w / 2;
+const iBig = bigM.L[3];
+const TIT_BIG = { x: bigX0 + iBig.x + iBig.w / 2, y: BIG_Y - BIG * 0.735, r: 22 };
+const iSm = label.L[10];
+const TIT_SM = { x: LBL_X + iSm.x + iSm.w / 2, y: LBL_Y - LBL_SIZE * 0.735, r: LBL_SIZE * 0.088 };
+const endTxt = layout('Motion designer', END.size, 750);
+const endX0 = CX - endTxt.w / 2 - 20;
+const PERIOD = { x: endX0 + endTxt.w + 26, y: END.y - 14, r: 17 };
+
+// 스프링 그래프: 오버슛 22% 근처
+const GZ = 0.43, GF = 1.25, GT = 2.4;
+const gv = u => sp(u * GT, GF, GZ);
+const gp = u => ({ x: G.x + G.w * u, y: G.y - G.h * gv(u) });
+
+function arc(a, b, k, lift) {
+  return { x: lerp(a.x, b.x, eio(k)), y: lerp(a.y, b.y, eio(k)) - Math.sin(Math.PI * k) * lift };
+}
+
+// ---- 점의 상태: 영상 전체를 잇는 하나의 함수 ----
+function dot(t) {
+  let k = sp(t - 0.85, 2.6, 0.8);
+  const knob = { x: lerp(KNOB_OFF, KNOB_ON, k), y: CY };
+  if (t < 1.6) return { ...knob, r: KNOB_R, sx: 1, sy: 1 };
+  const knobOn = { x: KNOB_ON, y: CY };
+  if (t < 2.75) {
+    const p = R(t, 1.6, 2.3);
+    const q = arc(knobOn, TIT_BIG, p, 260);
+    const b = bump(t - 2.3, 3.2, 7) * 0.35;
+    return { ...q, r: lerp(KNOB_R, TIT_BIG.r, eio(p)), sx: 1 + b, sy: 1 - b };
+  }
+  const O = gp(0);
+  if (t < 3.3) {
+    const squat = R(t, 2.75, 2.9) - R(t, 2.9, 2.98);
+    const p = R(t, 2.9, 3.3);
+    const q = arc(TIT_BIG, O, p, 320);
+    const b = bump(t - 3.3, 3.2, 7) * 0.3;
+    return { ...q, r: TIT_BIG.r, sx: 1 + squat * 0.25, sy: 1 - squat * 0.3 };
+  }
+  if (t < 5.2) {
+    const u = eio(R(t, 3.3, 4.7));
+    const q = gp(u);
+    const b = bump(t - 3.3, 3.2, 7) * 0.3;
+    return { ...q, r: TIT_BIG.r, sx: 1 + b, sy: 1 - b };
+  }
+  const E = gp(1);
+  if (t < 7.3) {
+    const p = R(t, 5.2, 5.6);
+    const q = { x: lerp(E.x, CX, ei(p) * 0.4 + eo(p) * 0.6), y: lerp(E.y, CY, eio(p)) };
+    const g = eio(R(t, 5.6, 6.25));
+    return { ...q, r: lerp(TIT_BIG.r, 1250, g), sx: 1, sy: 1 };
+  }
+  if (t < 10.8) {
+    const r = 22 * sp(t - 7.4, 2.4, 0.6);
+    const puls = 1 + 0.08 * Math.sin((t - 7.8) * Math.PI * 2 / 0.5) * R(t, 7.8, 8.0) * (1 - R(t, 8.8, 9.0));
+    return { x: CX, y: CY, r: r * puls, sx: 1, sy: 1 };
+  }
+  if (t < 12.55) {
+    const p = R(t, 10.8, 11.25);
+    const q = arc({ x: CX, y: CY }, PERIOD, p, 120);
+    const b = bump(t - 11.25, 3.5, 8) * 0.3;
+    return { ...q, r: lerp(22, PERIOD.r, eio(p)), sx: 1 + b, sy: 1 - b };
+  }
+  const p = R(t, 12.55, 13.05);
+  const q = arc(PERIOD, { x: KNOB_OFF, y: CY }, p, 300);
+  const b = bump(t - 13.05, 3.2, 12) * 0.25;
+  return { ...q, r: lerp(PERIOD.r, KNOB_R, eio(p)), sx: 1 + b, sy: 1 - b };
+}
+
+// ---- 장면 ----
+function sceneToggle(t) {
+  // 카드 스케일: 1.2~1.5 수축, 13.0~ 다시 등장
+  const out = 1 - eio(R(t, 1.25, 1.55));
+  const back = sp(t - 12.8, 2.8, 1);
+  const s = t < 6 ? out : back;
+  if (s > 0.001) {
+    ctx.save(); ctx.shadowColor = 'rgba(0,0,0,0.07)'; ctx.shadowBlur = 40 * s; ctx.shadowOffsetY = 14 * s;
+    rrect(CX, CY, CARD_W * s, CARD_H * s, 44 * s, CARD); ctx.restore();
+    const on = t < 6 ? sp(t - 0.85, 2.6, 0.8) : 0;
+    const tc = `rgb(${Math.round(lerp(214, 17, on))},${Math.round(lerp(209, 17, on))},${Math.round(lerp(198, 17, on))})`;
+    const ts = t < 6 ? 1 - eio(R(t, 1.3, 1.6)) : back;
+    rrect(TRACK.x, CY, TRACK.w * ts, TRACK.h * ts, 36, tc);
+  }
+  // 레이블 "Reduce " (0..6): 낙하 / 복귀 시 아래에서 상승
+  for (let i = 0; i < 7; i++) {
+    const c = label.L[i]; if (c.ch === ' ') continue;
+    let y = LBL_Y, rot = 0;
+    if (t < 6) { const dt = t - 1.2 - i * 0.035; y += fall(dt); rot = (dt > 0 ? dt : 0) * (i % 2 ? 2.2 : -1.8); }
+    else { const k = sp(t - 12.9 - i * 0.02, 3.2, 1); y += (1 - k) * 70; if (k < 0.02) continue; ctx.save(); ctx.beginPath(); ctx.rect(LBL_X - 10, LBL_Y - 70, 900, 92); ctx.clip(); glyph(c.ch, LBL_X + c.x, y, LBL_SIZE, 650, INK); ctx.restore(); continue; }
+    if (y < H + 120) glyph(c.ch, LBL_X + c.x, y, LBL_SIZE, 650, INK, rot);
+  }
+}
+
+function sceneWord(t) {
+  // "Motion" (label index 7..12) → 화면 중앙 큰 글자 → 낙하 / 복귀
+  const m = sp(t - 1.3, 1.5, 0.82);
+  const tit = 1 - eio(R(t, 1.3, 1.55));
+  for (let j = 0; j < 6; j++) {
+    const a = label.L[7 + j], b = bigM.L[j];
+    if (t >= 6) { // 복귀: 레이블 위치로 상승
+      const k = sp(t - 12.9 - (j + 7) * 0.02, 3.2, 1);
+      if (k < 0.02) continue;
+      ctx.save(); ctx.beginPath(); ctx.rect(LBL_X - 10, LBL_Y - 70, 900, 92); ctx.clip();
+      glyph(a.ch === 'i' ? 'ı' : a.ch, LBL_X + a.x, LBL_Y + (1 - k) * 70, LBL_SIZE, 650, INK); ctx.restore();
+      continue;
+    }
+    const size = lerp(LBL_SIZE, BIG, m);
+    const sx = lerp(LBL_X + a.x, bigX0 + b.x, m);
+    const sy = lerp(LBL_Y, BIG_Y, m);
+    const bend = Math.sin(Math.PI * clamp(m)) * 0.22 * ((j - 2.5) / 2.5);
+    const dt = t - 2.95 - j * 0.045;
+    const y = sy + fall(dt, 5200);
+    const rot = bend + (dt > 0 ? dt * (j % 2 ? 1.6 : -1.4) : 0);
+    if (y < H + 300) glyph(a.ch === 'i' ? 'ı' : a.ch, sx, y, size, lerp(650, 750, m), INK, rot);
+  }
+  if (t < 6 && tit > 0) circle(TIT_SM.x, TIT_SM.y, TIT_SM.r * tit, INK);
+  if (t >= 6) { const k = sp(t - 12.9 - 10 * 0.02, 3.2, 1); if (k > 0.02) circle(TIT_SM.x, TIT_SM.y + (1 - k) * 70, TIT_SM.r * k, INK); }
+}
+
+function sceneGraph(t) {
+  if (t < 2.75 || t > 5.28) return;
+  const draw = eio(R(t, 2.8, 3.25)), undraw = eio(R(t, 4.95, 5.3));
+  ctx.lineCap = 'round';
+  // 축
+  ctx.strokeStyle = INK; ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(G.x, G.y - G.h * 1.35 * undraw); ctx.lineTo(G.x, G.y - G.h * 1.35 * draw);
+  ctx.moveTo(G.x + G.w * 1.05 * undraw, G.y); ctx.lineTo(G.x + G.w * 1.05 * draw, G.y);
+  ctx.stroke();
+  // 목표선
+  const ty = G.y - G.h;
+  ctx.setLineDash([14, 14]); ctx.lineWidth = 3; ctx.strokeStyle = '#9C968A';
+  ctx.beginPath(); ctx.moveTo(G.x + G.w * 1.05 * undraw, ty); ctx.lineTo(G.x + G.w * 1.05 * draw, ty); ctx.stroke();
+  ctx.setLineDash([]);
+  const lab = eo(R(t, 3.1, 3.4)) * (1 - R(t, 4.95, 5.1));
+  if (lab > 0) { ctx.globalAlpha = 1; glyph('TARGET', G.x + G.w * 1.05 - 120, ty - 22, 24, 600, '#9C968A', 0, 1, MONO); }
+  // 스프링 곡선: 점을 움직이는 같은 함수
+  const u1 = eio(R(t, 3.3, 4.7)), u0 = undraw;
+  if (u1 > u0) {
+    ctx.strokeStyle = INK; ctx.lineWidth = 7; ctx.beginPath();
+    for (let i = 0; i <= 160; i++) { const u = lerp(u0, u1, i / 160); const p = gp(u); i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y); }
+    ctx.stroke();
+  }
+  // 콜아웃 +22%
+  const c = sp(t - 4.45, 2.4, 0.6) * (1 - eio(R(t, 4.95, 5.15)));
+  if (c > 0.01) {
+    const n = Math.round(22 * eo(R(t, 4.45, 4.85)));
+    const E = gp(1);
+    ctx.save(); ctx.translate(E.x + 60, E.y - 110); ctx.scale(c, c);
+    rrect(0, 0, 230, 100, 50, INK);
+    ctx.font = `750 56px ${SANS}`; ctx.fillStyle = OR; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(`+${n}%`, 0, 4); ctx.restore();
+  }
+  // 점이 원점에서 끝점으로 쏘아질 때의 선
+}
+
+function sceneShape(t) {
+  if (t < 5.2 || t > 7.7) return;
+  // 끝점→중앙으로 쏘아지는 선
+  const p = R(t, 5.2, 5.6);
+  if (p > 0 && p < 1) {
+    const E = gp(1), d = dot(t);
+    const tail = R(t, 5.3, 5.65);
+    ctx.strokeStyle = OR; ctx.lineWidth = 6; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(lerp(E.x, d.x, eio(tail)), lerp(E.y, d.y, eio(tail))); ctx.lineTo(d.x, d.y); ctx.stroke();
+  }
+  // 검은 라운드 사각 → 회전 → 알약 → 화면 덮기
+  const s = sp(t - 6.15, 2.2, 0.7);
+  if (s <= 0.001) return;
+  const rot = eio(R(t, 6.35, 6.9)) * Math.PI / 2;
+  const st = eio(R(t, 6.85, 7.25));
+  const cover = ei(R(t, 7.2, 7.6));
+  let w = 230 * s, h = 230 * s;
+  w = lerp(w, 600, st); h = lerp(h, 190, st);
+  w = lerp(w, 2600, cover); h = lerp(h, 1500, cover);
+  const r = lerp(lerp(52, 95, st), 0, cover);
+  ctx.save(); ctx.translate(CX, CY); ctx.rotate(rot);
+  rrect(0, 0, w, h, r, INK); ctx.restore();
+}
+
+const ORBIT = 'SPRINGS  ·  EASING  ·  KINETIC TYPE  ·  3D  ·  SOUND  ·  ';
+const orb = layout(ORBIT, 36, 700);
+function sceneOrbit(t) {
+  if (t < 7.5 || t > 10.0) return;
+  ctx.fillStyle = INK; ctx.fillRect(0, 0, W, H);
+  const rot = -Math.PI / 2 + (t - 7.6) * 0.55;
+  orb.L.forEach((c, i) => {
+    if (c.ch === ' ') return;
+    const a = rot + 2 * Math.PI * (c.x + c.w / 2) / orb.w;
+    const ap = sp(t - 7.7 - i * 0.012, 2.6, 0.7);
+    const go = eio(R(t, 9.0 + (i % 9) * 0.02, 9.55 + (i % 9) * 0.02));
+    const rr = ORBIT_R + go * 700;
+    const sc = ap * (1 - go);
+    if (sc < 0.01) return;
+    const x = CX + Math.cos(a) * rr, y = CY + Math.sin(a) * rr;
+    ctx.save(); ctx.translate(x, y); ctx.rotate(a + Math.PI / 2); ctx.scale(sc, sc);
+    ctx.font = `700 36px ${SANS}`; ctx.fillStyle = BG; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(c.ch, 0, 0); ctx.restore();
+  });
+}
+
+function sceneHalftone(t) {
+  if (t < 9.1 || t > 12.9) return;
+  if (t < 10.0) {} // 배경은 sceneOrbit가 칠함
+  else if (t < 10.85) { ctx.fillStyle = INK; ctx.fillRect(0, 0, W, H); }
+  if (t >= 10.85) return;
+  const S = 40, F = eo(R(t, 9.1, 10.1)) * 1250;
+  for (let gy = S / 2 - 20; gy < H + S; gy += S) for (let gx = S / 2 - 20; gx < W + S; gx += S) {
+    const d = Math.hypot(gx - CX, gy - CY);
+    const front = clamp((F - d) / 220);
+    let r = front * (3 + 9 * Math.exp(-d / 420));
+    const fk = eio(R(t, 10.15 + d / 1250 * 0.35, 10.5 + d / 1250 * 0.35));
+    r = lerp(r, 30, fk);
+    if (r > 0.3) circle(gx, gy, r, BG);
+  }
+}
+
+function sceneEnd(t) {
+  if (t < 10.6 || t > 13.1) return;
+  const lines = [
+    { txt: 'OPUS 5.5', size: 34, w: 600, font: MONO, y: END.y - 200, color: '#8A8478', d: 10.75 },
+    { txt: 'Motion designer', size: END.size, w: 750, font: SANS, y: END.y, color: INK, d: 10.85 },
+    { txt: '0 KEYFRAMES', size: 34, w: 600, font: MONO, y: END.y + 120, color: '#8A8478', d: 11.05 },
+  ];
+  lines.forEach((ln, li) => {
+    const lay = layout(ln.txt, ln.size, ln.w, ln.font);
+    const x0 = li === 1 ? endX0 : CX - lay.w / 2;
+    ctx.save(); ctx.beginPath(); ctx.rect(0, ln.y - ln.size * 1.05, W, ln.size * 1.35); ctx.clip();
+    lay.L.forEach((c, i) => {
+      if (c.ch === ' ') return;
+      const k = sp(t - ln.d - i * 0.025, 2.4, 0.85);
+      const outk = ei(R(t, 12.4 + li * 0.04 + i * 0.01, 12.62 + li * 0.04 + i * 0.01));
+      const y = ln.y + (1 - k) * ln.size * 1.1 + outk * ln.size * 1.2;
+      glyph(c.ch, x0 + c.x, y, ln.size, ln.w, ln.color, 0, 1, ln.font);
+    });
+    ctx.restore();
+  });
+}
+
+function cursor(t) {
+  const start = { x: 1560, y: 930 };
+  const knob = { x: KNOB_OFF + 6, y: CY + 8 };
+  let p, press = 0;
+  if (t < 1.0) { const k = R(t, 0.05, 0.72); p = { x: lerp(start.x, knob.x, eio(k)), y: lerp(start.y, knob.y, eio(k)) }; press = R(t, 0.76, 0.84) - R(t, 0.86, 0.96); }
+  else if (t < 6) { const k = R(t, 1.0, 1.5); p = { x: lerp(knob.x, 2050, ei(k)), y: lerp(knob.y, 1250, ei(k)) }; }
+  else { const k = R(t, 12.9, 13.6); p = { x: lerp(2050, start.x, eo(k)), y: lerp(1250, start.y, eo(k)) }; if (k <= 0) return; }
+  if (p.x > W + 60) return;
+  const s = 1.5 * (1 - 0.15 * press);
+  ctx.save(); ctx.translate(p.x, p.y); ctx.scale(s, s);
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, 26); ctx.lineTo(6.5, 20); ctx.lineTo(11, 30); ctx.lineTo(15, 28); ctx.lineTo(10.5, 18.5); ctx.lineTo(19, 18.5); ctx.closePath();
+  ctx.fillStyle = INK; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = '#fff'; ctx.stroke(); ctx.restore();
+}
+
+function render(t) {
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+  sceneToggle(t);
+  sceneWord(t);
+  sceneGraph(t);
+  const d = dot(t);
+  if (t >= 5.2 && t < 7.7) { circle(d.x, d.y, d.r, OR); sceneShape(t); }
+  sceneOrbit(t);
+  sceneHalftone(t);
+  sceneEnd(t);
+  if (!(t >= 5.2 && t < 7.4)) circle(d.x, d.y, d.r, OR, d.sx, d.sy);
+  cursor(t);
+}
+
+window.DUR = DUR;
+window.seek = async t => { render(((t % DUR) + DUR) % DUR); };
+// 브라우저에서 열면 재생 (?t=3.2 로 정지)
+const qt = new URLSearchParams(location.search).get('t');
+if (qt !== null) render(+qt);
+else if (!navigator.webdriver) { const t0 = performance.now(); const loop = () => { render(((performance.now() - t0) / 1000) % DUR); requestAnimationFrame(loop); }; loop(); }
+else render(0);
+</script></body></html>
